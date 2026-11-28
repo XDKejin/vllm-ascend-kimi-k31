@@ -45,7 +45,6 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context impor
 from vllm_ascend.utils import lmhead_tp_enable, lmhead_tp_max_num_logits
 from vllm_ascend.worker.dcp_utils import DCPManager
 from vllm_ascend.worker.v2.aclgraph_utils import _get_graph_update_backend
-from vllm_ascend.worker.v2.spec_decode.dspark.draft_config import _get_native_window_gqa_width
 from vllm_ascend.worker.v2.attn_utils import (
     build_attn_metadata_factory,
     build_attn_metadata_wrapper,
@@ -77,55 +76,7 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
         self.attn_architecture: str | None = None
         self._draft_mla_uses_device_lengths = False
         self._window_gqa_attn_vllm_config: VllmConfig | None = None
-        self._verify_num_speculative_steps = self.num_speculative_steps
-        self._native_num_speculative_steps = (
-            _get_native_window_gqa_width(self.draft_model_config.hf_config, self.num_speculative_steps)
-            if uses_kimi_gqa_draft(vllm_config)
-            else None
-        )
-        if self._native_num_speculative_steps is not None:
-            self._use_native_window_gqa_width()
         self._init_dcp()
-
-    def _use_native_window_gqa_width(self) -> None:
-        """Resize V2 DSpark-only buffers for RedHat's fixed eight-row graph."""
-        native_steps = self._native_num_speculative_steps
-        assert native_steps is not None
-        if native_steps <= self._verify_num_speculative_steps:
-            return
-        if self.enable_adaptive_verification:
-            raise ValueError("Native-width Window-GQA DSpark does not yet support adaptive verification.")
-        self.num_speculative_steps = native_steps
-        self.num_query_per_req = native_steps if self.sample_from_anchor else 1 + native_steps
-        self.draft_tokens = torch.zeros(
-            self.max_num_reqs,
-            native_steps,
-            dtype=torch.int64,
-            device=self.device,
-        )
-        self._step_cols = torch.arange(native_steps, dtype=torch.int32, device=self.device)
-        self._anchor_idx = (
-            torch.arange(self.max_num_reqs, dtype=torch.int64, device=self.device)
-            * self.num_query_per_req
-        )
-        sample_capacity = self.max_num_reqs * native_steps
-        self.sample_indices = torch.zeros(sample_capacity, dtype=torch.int64, device=self.device)
-        self.sample_pos = torch.zeros(sample_capacity, dtype=torch.int64, device=self.device)
-        # ``-1`` marks padded rows as inert.  A zero here would make a full
-        # graph replay write padding logits into request-state row zero.
-        self.sample_idx_mapping = torch.full(
-            (sample_capacity,), -1, dtype=torch.int32, device=self.device
-        )
-        self.sample_col = torch.arange(native_steps, dtype=torch.int32, device=self.device).repeat(self.max_num_reqs)
-        if self.draft_logits is not None:
-            self.draft_logits = self.draft_logits.new_zeros(
-                self.max_num_reqs, native_steps, self.draft_logits.shape[2]
-            )
-
-    def _public_draft_tokens(self, draft_tokens: torch.Tensor) -> torch.Tensor:
-        if self._native_num_speculative_steps is None:
-            return draft_tokens
-        return draft_tokens[:, : self._verify_num_speculative_steps].contiguous()
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
@@ -577,7 +528,7 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
                 parallel_config=self.attn_vllm_config.parallel_config,
             ),
         ):
-            draft_tokens = super().propose(
+            return super().propose(
                 input_batch,
                 attn_metadata,
                 slot_mappings,
@@ -595,4 +546,3 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
                 mm_inputs,
                 is_profile=is_profile,
             )
-        return self._public_draft_tokens(draft_tokens)

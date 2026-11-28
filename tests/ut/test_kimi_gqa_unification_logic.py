@@ -178,27 +178,53 @@ class TestKimiGqaUnification(unittest.TestCase):
         self.assertFalse(owner.vllm_config.attention_config.use_non_causal)
         self.assertEqual(owner.vllm_config.parallel_config.decode_context_parallel_size, 8)
 
-    def test_native_width_does_not_change_verify_three(self):
-        ns = extract(
-            V2 + "draft_config.py",
-            {"_draft_config_value", "_mapping_value", "_get_native_window_gqa_width"},
-            {"_REDHAT_WINDOW_GQA_NATIVE_WIDTH": 8, "_REDHAT_WINDOW_GQA_VERIFY_WIDTH": 7},
+    def test_kimi_speculator_preserves_configured_width_and_parent_buffers(self):
+        class Parent:
+            def __init__(self, cfg, device):
+                self.vllm_config = cfg
+                self.draft_model_config = cfg.speculative_config.draft_model_config
+                self.num_speculative_steps = cfg.speculative_config.num_speculative_tokens
+                self.sample_from_anchor = self.draft_model_config.hf_config.sample_from_anchor
+                self.num_query_per_req = self.num_speculative_steps + (not self.sample_from_anchor)
+                self.enable_adaptive_verification = cfg.speculative_config.enable_adaptive_verification
+                self.draft_tokens = NS(shape=(4, self.num_speculative_steps))
+
+            def _lmhead_tp_validate_draft_sampling(self):
+                pass
+
+            def _init_dcp(self):
+                pass
+
+        tree = ast.parse((ROOT / (V2 + "speculator.py")).read_text(encoding="utf-8"))
+        cls = next(
+            node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "AscendDSparkSpeculator"
         )
-        cfg = NS(
-            architectures=["DSparkDraftModel"],
-            transformer_layer_config={
-                "model_type": "qwen3",
-                "block_size": 8,
-                "sample_from_anchor": True,
-                "use_sliding_window": True,
-            },
-            aux_hidden_state_layer_ids=[1, 17],
-        )
-        native = ns["_get_native_window_gqa_width"]
-        self.assertEqual(native(cfg, 7), 8)
-        self.assertIsNone(native(cfg, 3))
-        cfg.transformer_layer_config["sample_from_anchor"] = False
-        self.assertIsNone(native(cfg, 7))
+        cls.bases = [ast.Name(id="Parent", ctx=ast.Load())]
+        cls.body = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "__init__"]
+        future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
+        module = ast.fix_missing_locations(ast.Module(body=[future, cls], type_ignores=[]))
+        ns = {"Parent": Parent, "prepare_replicated_pcp_config": lambda cfg: (cfg, False)}
+        exec(compile(module, "speculator_init", "exec"), ns)
+        for model in ("kimi_k3", "kimi_k31"):
+            for width in (3, 7):
+                for anchor in (False, True):
+                    for adaptive in (False, True):
+                        with self.subTest(model=model, width=width, anchor=anchor, adaptive=adaptive):
+                            cfg = config(model)
+                            cfg.speculative_config.num_speculative_tokens = width
+                            cfg.speculative_config.enable_adaptive_verification = adaptive
+                            cfg.speculative_config.draft_model_config.hf_config = NS(
+                                model_type="qwen3",
+                                architectures=["Qwen3DSparkModel"],
+                                sample_from_anchor=anchor,
+                                use_sliding_window=True,
+                                block_size=8,
+                                eagle_aux_hidden_state_layer_ids=[1, 17],
+                            )
+                            owner = ns["AscendDSparkSpeculator"](cfg, "cpu")
+                            self.assertEqual(owner.num_speculative_steps, width)
+                            self.assertEqual(owner.num_query_per_req, width + (not anchor))
+                            self.assertEqual(owner.draft_tokens.shape, (4, width))
 
     def test_checkpoint_normalization_preserves_legacy_and_layer_numbering(self):
         ns = extract(
@@ -236,7 +262,13 @@ class TestKimiGqaUnification(unittest.TestCase):
         self.assertEqual(redhat.target_layer_ids, [0, 16])
         self.assertEqual(redhat.eagle_aux_hidden_state_layer_ids, [1, 17])
         self.assertTrue(redhat.dflash_config["causal"])
-        self.assertEqual(redhat.dflash_config["swa_window_size"], 519)
+        self.assertEqual(redhat.sliding_window, 512)
+        self.assertNotIn("swa_window_size", redhat.dflash_config)
+        self.assertNotIn("use_swa", redhat.dflash_config)
+        redhat.dflash_config.update(use_swa=True, swa_window_size=512)
+        normalize(redhat)
+        self.assertEqual(redhat.dflash_config["swa_window_size"], 512)
+        self.assertTrue(redhat.dflash_config["use_swa"])
 
     def converter(self):
         ns = core_helpers()
@@ -248,7 +280,6 @@ class TestKimiGqaUnification(unittest.TestCase):
             torch=NS(bfloat16="bf16"),
             KVQuantMode=NS(NONE="none"),
             supports_component_major_mla_pd=lambda c: True,
-            uses_kimi_k31_bf16_cache=lambda c: False,
             logger=NS(info_once=lambda *a: None),
         )
         return extract("vllm_ascend/worker/v2/attn_utils.py", {"mark_kimi_gqa_draft_specs"}, ns)[
@@ -264,14 +295,29 @@ class TestKimiGqaUnification(unittest.TestCase):
         self.assertIs(marked["target"], specs["target"])
         self.assertEqual(convert(config(), marked, ["draft"]), marked)
 
-    def test_pd_packing_uses_actual_target_block_not_global_minimum(self):
+    def test_pd_packing_defaults_to_cache_config_for_k3_and_k31(self):
+        convert = self.converter()
+        for model in ("kimi_k3", "kimi_k31"):
+            for dtype, block in (("int8", 1664), ("bfloat16", 768)):
+                with self.subTest(model=model, dtype=dtype):
+                    cfg = config(model)
+                    cfg.cache_config.cache_dtype = dtype
+                    cfg.cache_config.block_size = block
+                    cfg.kv_transfer_config = NS(get_from_extra_config=lambda key, default: default)
+                    specs = {"target": FullSpec(128), "draft": SlidingSpec(sliding_window=512)}
+                    marked = convert(cfg, specs, ["draft"])
+                    self.assertEqual(marked["draft"].block_size, block)
+                    self.assertIs(marked["target"], specs["target"])
+                    self.assertEqual(convert(cfg, marked, ["draft"]), marked)
+                    cfg.cache_config.block_size = 128
+                    specs["target"] = FullSpec(1664)
+                    self.assertEqual(convert(cfg, specs, ["draft"])["draft"].block_size, 128)
         cfg = config()
-        cfg.kv_transfer_config = NS(get_from_extra_config=lambda key, default: default)
-        marked = self.converter()(cfg, {"target": FullSpec(1664), "draft": SlidingSpec(sliding_window=512)}, ["draft"])
-        self.assertEqual(marked["draft"].block_size, 1664)
+        cfg.kv_transfer_config = NS(get_from_extra_config=lambda key, default: 384)
+        self.assertEqual(convert(cfg, {"draft": SlidingSpec(sliding_window=512)}, ["draft"])["draft"].block_size, 384)
         cfg.kv_transfer_config.get_from_extra_config = lambda key, default: 129
         with self.assertRaises(ValueError):
-            self.converter()(cfg, {"draft": SlidingSpec(sliding_window=512)}, ["draft"])
+            convert(cfg, {"draft": SlidingSpec(sliding_window=512)}, ["draft"])
 
     def test_converter_rejects_padded_draft_and_pcp(self):
         cfg = config()

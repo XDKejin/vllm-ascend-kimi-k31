@@ -295,7 +295,8 @@ def test_kimi_k31_gqa_draft_spec_rejects_context_parallelism(vllm_config):
     [
         (None, "auto", None, 128),
         ("OtherConnector", "auto", None, 128),
-        ("MooncakeConnectorV2", "int8", None, 128),
+        ("MooncakeConnectorV2", "int8", None, 768),
+        ("MooncakeConnectorV2", "auto", None, 768),
         ("MooncakePullConnector", "auto", 384, 384),
         ("MooncakeConnectorV2", "auto", 0, None),
         ("MooncakeConnectorV2", "auto", 129, None),
@@ -304,7 +305,7 @@ def test_kimi_k31_gqa_draft_spec_rejects_context_parallelism(vllm_config):
 )
 def test_gqa_dspark_swa_page_selection(vllm_config, connector, cache_dtype, override, expected):
     vllm_config.parallel_config.prefill_context_parallel_size = 1
-    options = {"dspark_swa_block_size": override}
+    options = {} if override is None else {"dspark_swa_block_size": override}
     vllm_config.kv_transfer_config = (
         SimpleNamespace(kv_connector=connector, get_from_extra_config=options.get) if connector else None
     )

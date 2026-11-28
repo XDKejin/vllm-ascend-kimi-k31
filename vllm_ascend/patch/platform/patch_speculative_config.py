@@ -184,20 +184,6 @@ def _normalize_legacy_qwen3_dspark_config(hf_config: PretrainedConfig) -> Pretra
         ):
             dflash_config.setdefault("causal", True)
 
-        # The trained anchor block has eight rows while vLLM verifies seven
-        # draft tokens. The proposer executes the native width and crops its
-        # final row; keep the same SWA metadata convention in the config.
-        sliding_window = getattr(hf_config, "sliding_window", None)
-        native_width = getattr(hf_config, "block_size", None)
-        if (
-            sliding_window is not None
-            and bool(getattr(hf_config, "use_sliding_window", False))
-            and bool(getattr(hf_config, "sample_from_anchor", False))
-            and aux_layer_ids is not None
-            and native_width == 8
-        ):
-            dflash_config["use_swa"] = True
-            dflash_config["swa_window_size"] = int(sliding_window) + native_width - 1
         if target_layer_ids is not None:
             dflash_config["target_layer_ids"] = list(target_layer_ids)
         if normalized["mask_token_id"] is not None:

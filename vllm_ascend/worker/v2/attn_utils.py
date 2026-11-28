@@ -87,9 +87,9 @@ from vllm_ascend.core.kv_cache_interface import (
     get_kv_cache_compression_ratio,
     get_storage_block_size,
     is_kimi_gqa_draft_spec,
+    is_kimi_k31_model_config,
     supports_component_major_mla_pd,
     uses_kimi_gqa_draft,
-    uses_kimi_k31_bf16_cache,
 )
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
@@ -456,17 +456,7 @@ def mark_kimi_gqa_draft_specs(
     pack_swa = (
         transfer is not None
         and supports_component_major_mla_pd(vllm_config)
-        and (uses_kimi_k31_bf16_cache(vllm_config) or is_k3)
-    )
-    # EngineCore can replace cache_config.block_size with the minimum group
-    # size. Preserve the target's actual block span across repeated planning.
-    target_block_size = max(
-        (
-            spec.block_size
-            for name, spec in kv_cache_specs.items()
-            if name not in draft_layer_names and isinstance(spec, FullAttentionSpec)
-        ),
-        default=vllm_config.cache_config.block_size,
+        and (is_kimi_k31_model_config(vllm_config.model_config) or is_k3)
     )
     for name in draft_layer_names:
         spec = kv_cache_specs[name]
@@ -491,7 +481,7 @@ def mark_kimi_gqa_draft_specs(
         if pack_swa and draft_spec_type is AscendGQADraftSlidingWindowSpec:
             # A draft page consumes a whole ID in the much wider target/KDA
             # pool. Group several native FIA pages under one scheduler ID.
-            manager_block = transfer.get_from_extra_config("dspark_swa_block_size", target_block_size)
+            manager_block = transfer.get_from_extra_config("dspark_swa_block_size", vllm_config.cache_config.block_size)
             if type(manager_block) is not int or manager_block <= 0 or manager_block % spec.block_size:
                 raise ValueError(f"dspark_swa_block_size must be a positive multiple of {spec.block_size}.")
             spec = replace(spec, block_size=manager_block, page_size_padded=None)
