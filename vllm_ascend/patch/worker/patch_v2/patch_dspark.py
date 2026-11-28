@@ -46,7 +46,7 @@ import vllm.v1.worker.gpu.spec_decode.dspark.utils as dspark_utils
 import vllm.v1.worker.gpu.spec_decode.eagle.utils as eagle_utils
 from vllm.distributed.parallel_state import get_pp_group
 
-from vllm_ascend.core.kv_cache_interface import with_kimi_k31_gqa_draft_dcp_config
+from vllm_ascend.core.kv_cache_interface import with_kimi_gqa_draft_dcp_config
 from vllm_ascend.worker.v2.pp_transport import (
     bypass_upstream_spec_pp_guard,
     resolve_spec_pp_support,
@@ -111,7 +111,7 @@ def _load_dspark_model_with_target_quant(target_model, vllm_config):
         if spec_pp_support is not None:
             partition_mask = patch.object(vllm_envs, "VLLM_PP_LAYER_PARTITION", None)
         with partition_mask, bypass_upstream_spec_pp_guard(vllm_config, spec_pp_support):
-            draft_config = with_kimi_k31_gqa_draft_dcp_config(vllm_config)
+            draft_config = with_kimi_gqa_draft_dcp_config(vllm_config)
             if draft_config is not vllm_config and draft_config.parallel_config.enable_eplb:
                 # Upstream rebuilds this dataclass to disable EPLB for the
                 # draft. Keep Ascend's auto-selection metadata on the target.

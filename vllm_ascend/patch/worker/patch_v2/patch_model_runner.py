@@ -23,7 +23,7 @@ from vllm_ascend.ascend_forward_context import (
 )
 from vllm_ascend.attention.attention_v1 import AscendKimiK31GQADraftAttentionImpl
 from vllm_ascend.attention.context_parallel.common_cp import is_pcp_decode_sharding_enabled
-from vllm_ascend.core.kv_cache_interface import get_kv_cache_dcp_size, uses_kimi_k31_gqa_draft
+from vllm_ascend.core.kv_cache_interface import get_kv_cache_dcp_size, uses_kimi_gqa_draft
 from vllm_ascend.worker.utils import copy_kv_cache_blocks_inplace
 from vllm_ascend.worker.v2.moe_utils import (
     V2MoEPhaseMetadata,
@@ -145,7 +145,7 @@ def _check_attention_cp_compatibility(
         draft_layer_names
         and dcp_size > 1
         and parallel.prefill_context_parallel_size == 1
-        and uses_kimi_k31_gqa_draft(vllm_config)
+        and uses_kimi_gqa_draft(vllm_config)
     ):
         # Upstream uses target_layer_names only for PCP. Its DCP checks
         # inspect the shared registry, which also contains the local draft.

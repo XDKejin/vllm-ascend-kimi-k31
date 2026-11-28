@@ -36,7 +36,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import MambaManager
 from vllm.v1.outputs import KVConnectorOutput
 
-from vllm_ascend.core.kv_cache_interface import uses_kimi_k31_gqa_draft
+from vllm_ascend.core.kv_cache_interface import uses_kimi_gqa_draft
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.base_scheduler import (
     MooncakeBaseConnectorScheduler,
 )
@@ -73,7 +73,7 @@ class MooncakeBaseConnector(KVConnectorBase_V1, SupportsHMA):
     def supports_divergent_local_hybrid_hits(self) -> bool:
         # The request exposes one local token count. It cannot represent a
         # shorter local hit for either of the independent GQA draft groups.
-        return not (uses_kimi_k31_bf16_cache(self._vllm_config) and uses_kimi_k31_gqa_draft(self._vllm_config))
+        return not (uses_kimi_k31_bf16_cache(self._vllm_config) and uses_kimi_gqa_draft(self._vllm_config))
 
     def __init__(
         self,
@@ -108,7 +108,7 @@ class MooncakeBaseConnector(KVConnectorBase_V1, SupportsHMA):
         if model_config.use_mla:
             # A pure MLA cache has no separate head dimension. Kimi K3.1 can
             # also have a GQA DSpark draft whose KV transfer is head-strided.
-            if not uses_kimi_k31_gqa_draft(vllm_config):
+            if not uses_kimi_gqa_draft(vllm_config):
                 return None
 
         logger.info_once("MooncakeConnector is setting the KV cache layout to HND for direct D2D transfer.")
@@ -278,7 +278,7 @@ class MooncakePullConnector(MooncakeBaseConnector):
             or transfer.kv_role != "kv_producer"
             or transfer.kv_connector not in ("MooncakeConnectorV2", "MooncakePullConnector")
             or not uses_kimi_k31_bf16_cache(config)
-            or not uses_kimi_k31_gqa_draft(config)
+            or not uses_kimi_gqa_draft(config)
             or not config.use_v2_model_runner
             or config.parallel_config.pipeline_parallel_size != 1
             or config.parallel_config.prefill_context_parallel_size != 1

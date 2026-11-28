@@ -2,16 +2,21 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 """Shared full-history and recurrent grouping for Kimi K3 and K3.1."""
 
+from dataclasses import replace
+
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
+    KVCacheTensor,
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_ascend.core.kv_cache_interface import is_kimi_gqa_draft_spec
 from vllm_ascend.utils import vllm_version_is
 
 # vLLM main moved this helper to kv_cache_planning after v0.32.0.
@@ -136,3 +141,90 @@ def _get_kimi_k3_dspark_mixed_kv_cache_groups(
         [len(group.layer_names) for group in groups[1:]],
     )
     return groups
+
+
+def append_kimi_gqa_draft_groups(groups, draft):
+    """Keep each native GQA geometry separate from target and recurrent ownership."""
+    by_spec = {}
+    for name, spec in draft.items():
+        if not is_kimi_gqa_draft_spec(spec):
+            raise ValueError(f"Kimi GQA draft layer {name} has an unmarked cache spec")
+        by_spec.setdefault(spec, []).append(name)
+    groups.extend(KVCacheGroupSpec(names, spec, is_eagle_group=True) for spec, names in by_spec.items())
+    return groups
+
+
+def kimi_gqa_pool_bytes(groups):
+    """Target groups alias native slots; draft planes occupy a private region."""
+    target = [group for group in groups if not is_kimi_gqa_draft_spec(group.kv_cache_spec)]
+    draft = [group for group in groups if is_kimi_gqa_draft_spec(group.kv_cache_spec)]
+    target_bytes = max(
+        (sum(_layer_spec(group, name).page_size_bytes for name in group.layer_names) for group in target),
+        default=0,
+    )
+    draft_bytes = sum(len(group.layer_names) * group.kv_cache_spec.page_size_bytes for group in draft)
+    return target_bytes + draft_bytes
+
+
+def _layer_spec(group, name):
+    spec = group.kv_cache_spec
+    return spec.kv_cache_specs[name] if isinstance(spec, UniformTypeKVCacheSpecs) else spec
+
+
+def kimi_gqa_max_memory(config, groups):
+    blocks = 0
+    for group in groups:
+        specs = [_layer_spec(group, name) for name in group.layer_names]
+        blocks += max(
+            (cdiv(spec.max_memory_usage_bytes(config), spec.page_size_bytes) for spec in specs),
+            default=0,
+        )
+    return blocks * kimi_gqa_pool_bytes(groups)
+
+
+def kimi_gqa_cache_config(config, groups, available_memory, target_config_factory):
+    """Use K3.1's native draft-plane layout without its SFA/indexer overlay.
+
+    A private draft region is necessary: its all-K/all-V planes cannot alias
+    the target's block-first pages at arbitrary manager block IDs.
+    """
+    target = [group for group in groups if group.layer_names and not is_kimi_gqa_draft_spec(group.kv_cache_spec)]
+    draft = [group for group in groups if is_kimi_gqa_draft_spec(group.kv_cache_spec)]
+    bytes_per_block = kimi_gqa_pool_bytes(groups)
+    if not draft or bytes_per_block <= 0:
+        raise ValueError("Kimi GQA cache layout requires materializable layers and draft groups")
+    num_blocks = config.cache_config.num_gpu_blocks_override
+    if num_blocks is None:
+        num_blocks = available_memory // bytes_per_block
+    draft_bytes = sum(len(group.layer_names) * group.kv_cache_spec.page_size_bytes for group in draft)
+    target_bytes = bytes_per_block - draft_bytes
+    if target_bytes:
+        target_config = target_config_factory(config, target, num_blocks * target_bytes)
+    else:
+        # Worker projection can retain empty target groups on a draft-only rank.
+        target_config = KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=[],
+            kv_cache_groups=target,
+            prefix_cache_retention_interval=config.cache_config.prefix_cache_retention_interval,
+        )
+    if target_config.num_blocks != num_blocks:
+        raise ValueError("Kimi target and draft must agree on the number of shared pool IDs")
+    size = bytes_per_block * num_blocks
+    tensors = [replace(tensor, size=size) for tensor in target_config.kv_cache_tensors]
+    offset = target_bytes * num_blocks
+    for group in draft:
+        for name in group.layer_names:
+            page_bytes = group.kv_cache_spec.page_size_bytes
+            layer_size = page_bytes * num_blocks
+            tensors.append(
+                KVCacheTensor(
+                    size=size,
+                    layers=[name],
+                    offset=offset,
+                    layer_stride=layer_size,
+                    block_stride=page_bytes,
+                )
+            )
+            offset += layer_size
+    return replace(target_config, kv_cache_groups=groups, kv_cache_tensors=tensors)

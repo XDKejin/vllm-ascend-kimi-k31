@@ -26,7 +26,7 @@ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
 @dataclass(frozen=True, kw_only=True)
 class AscendGQADraftFullAttentionSpec(FullAttentionSpec):
-    """Full-history GQA cache owned by the Kimi K3.1 DSpark draft."""
+    """Full-history GQA cache owned by a Kimi DSpark draft."""
 
     is_draft: bool = field(default=True, init=False)
     separate_block_pool: bool = False
@@ -40,7 +40,7 @@ class AscendGQADraftFullAttentionSpec(FullAttentionSpec):
 
 @dataclass(frozen=True, kw_only=True)
 class AscendGQADraftSlidingWindowSpec(SlidingWindowSpec):
-    """Sliding-window GQA cache owned by the Kimi K3.1 DSpark draft."""
+    """Sliding-window GQA cache owned by a Kimi DSpark draft."""
 
     is_draft: bool = field(default=True, init=False)
     separate_block_pool: bool = False
@@ -93,25 +93,54 @@ def uses_kimi_k31_gqa_draft(vllm_config: VllmConfig) -> bool:
     )
 
 
+def uses_kimi_gqa_draft(vllm_config: VllmConfig) -> bool:
+    """K3 and K3.1 share the TP-sharded, sequence-replicated GQA drafter."""
+    if uses_kimi_k31_gqa_draft(vllm_config):
+        return True
+    if not getattr(vllm_config, "use_v2_model_runner", False):
+        return False
+    model = getattr(vllm_config, "model_config", None)
+    hf_config = getattr(model, "hf_config", None)
+    speculative = getattr(vllm_config, "speculative_config", None)
+    draft = getattr(speculative, "draft_model_config", None)
+    draft_hf = getattr(draft, "hf_config", None)
+    architectures = getattr(draft, "architectures", None) or getattr(draft_hf, "architectures", ()) or ()
+    return (
+        getattr(hf_config, "model_type", None) in ("kimi_k3", "kimi_linear")
+        and getattr(speculative, "method", None) == "dspark"
+        and any(name in architectures for name in ("Qwen3DSparkModel", "DSparkDraftModel"))
+        and not (getattr(draft, "use_mla", False) or getattr(draft_hf, "use_mla", False))
+    )
+
+
+def is_kimi_gqa_draft_spec(spec: KVCacheSpec) -> bool:
+    """Resolve the explicit draft ownership before and after scheduler unwrapping."""
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        specs = tuple(spec.kv_cache_specs.values())
+        return bool(specs) and all(is_kimi_gqa_draft_spec(inner) for inner in specs)
+    return isinstance(spec, (AscendGQADraftFullAttentionSpec, AscendGQADraftSlidingWindowSpec))
+
+
 def get_kv_cache_dcp_size(spec: KVCacheSpec, process_dcp_size: int) -> int:
     """Use the process DCP size for sharded cache groups and 1 for the GQA draft."""
-    if isinstance(spec, UniformTypeKVCacheSpecs):
-        spec = spec.first_spec
-    if isinstance(spec, (AscendGQADraftFullAttentionSpec, AscendGQADraftSlidingWindowSpec)):
-        return 1
-    return process_dcp_size
+    return 1 if is_kimi_gqa_draft_spec(spec) else process_dcp_size
 
 
-def with_kimi_k31_gqa_draft_dcp_config(vllm_config: VllmConfig) -> VllmConfig:
+def with_kimi_gqa_draft_dcp_config(vllm_config: VllmConfig) -> VllmConfig:
     """Retain TP and the shared forward context while configuring draft attention."""
-    if not uses_kimi_k31_gqa_draft(vllm_config) or vllm_config.parallel_config.decode_context_parallel_size == 1:
+    if not uses_kimi_gqa_draft(vllm_config) or vllm_config.parallel_config.decode_context_parallel_size == 1:
         return vllm_config
     draft_config = copy(vllm_config)
     draft_config.parallel_config = copy(vllm_config.parallel_config)
     draft_config.parallel_config.decode_context_parallel_size = 1
     draft_config.parallel_config.cp_kv_cache_interleave_size = 1
+    draft_config.parallel_config.dcp_kv_cache_interleave_size = 1
     draft_config.cache_config = copy(vllm_config.cache_config)
     return draft_config
+
+
+# Retain the existing import for integrations using the K3.1-specific name.
+with_kimi_k31_gqa_draft_dcp_config = with_kimi_gqa_draft_dcp_config
 
 
 def get_kv_cache_compression_ratio(kv_cache_spec: KVCacheSpec) -> int:

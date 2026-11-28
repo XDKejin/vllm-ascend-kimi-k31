@@ -27,6 +27,7 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendGQADraftFullAttentionSpec,
     AscendGQADraftSlidingWindowSpec,
     get_kv_cache_dcp_size,
+    is_kimi_gqa_draft_spec,
     is_prefix_cacheable,
 )
 from vllm_ascend.models.deepseek_v41.cache_config import (
@@ -44,6 +45,12 @@ from vllm_ascend.models.glm5next.cache_config import (
     get_glm5_next_pool_bytes_per_block,
 )
 from vllm_ascend.models.glm5next.kv_cache import is_glm5_next_cache_spec
+from vllm_ascend.models.kimi_k3.cache_config import (
+    append_kimi_gqa_draft_groups,
+    kimi_gqa_cache_config,
+    kimi_gqa_max_memory,
+    kimi_gqa_pool_bytes,
+)
 from vllm_ascend.models.kimi_k3.paired_sfa_cache import (
     paired_sfa_cache_config,
     paired_sfa_cache_groups,
@@ -76,11 +83,11 @@ def _validate_kv_cache_layout(layout, kv_cache_groups) -> None:
             else (group.kv_cache_spec,)
         )
     )
-    has_paired_gqa = _uses_paired_sfa_groups(kv_cache_groups) and any(
+    has_gqa_draft = any(
         isinstance(group.kv_cache_spec, (AscendGQADraftFullAttentionSpec, AscendGQADraftSlidingWindowSpec))
         for group in kv_cache_groups
     )
-    if (has_c8 or has_paired_gqa) and layout.is_layer_compact and layout.is_block_compact:
+    if (has_c8 or has_gqa_draft) and layout.is_layer_compact and layout.is_block_compact:
         return
     _orig_validate_kv_cache_layout(layout, kv_cache_groups)
 
@@ -135,12 +142,13 @@ def _ascend_resolve_kv_cache_block_sizes(
     if any(get_kv_cache_dcp_size(group.kv_cache_spec, dcp) != dcp for group in groups):
         group_spans = [
             group.kv_cache_spec.block_size
-            * (1 if isinstance(group.kv_cache_spec, MambaSpec) else get_kv_cache_dcp_size(group.kv_cache_spec, dcp))
+            * (1 if get_kv_cache_spec_kind(group.kv_cache_spec) == KVCacheSpecKind.MAMBA else get_kv_cache_dcp_size(group.kv_cache_spec, dcp))
             for group in groups
         ]
         scheduler_block_size = math.lcm(*group_spans)
         if not (cache_config.enable_prefix_caching or vllm_config.kv_transfer_config is not None) or any(
-            isinstance(group.kv_cache_spec, MambaSpec) and group.kv_cache_spec.mamba_cache_mode != "align"
+            get_kv_cache_spec_kind(group.kv_cache_spec) == KVCacheSpecKind.MAMBA
+            and getattr(getattr(group.kv_cache_spec, "first_spec", group.kv_cache_spec), "mamba_cache_mode", None) != "align"
             for group in groups
         ):
             return scheduler_block_size, scheduler_block_size
@@ -603,6 +611,8 @@ def _ascend_pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int
     """
     if _uses_paired_sfa_groups(kv_cache_groups):
         return paired_sfa_pool_bytes(kv_cache_groups)
+    if any(is_kimi_gqa_draft_spec(group.kv_cache_spec) for group in kv_cache_groups):
+        return kimi_gqa_pool_bytes(kv_cache_groups)
     if tq_cache.uses_turboquant_groups(kv_cache_groups):
         return tq_cache.pool_bytes_per_block(kv_cache_groups)
     if is_deepseek_v41_cache(kv_cache_groups):
@@ -623,6 +633,8 @@ def _ascend_max_memory_usage_bytes_from_groups(
     """Account for the actual backing allocations in hybrid models."""
     if getattr(vllm_config.model_config.hf_config, "model_type", None) == "kimi_k31":
         return paired_sfa_max_memory(vllm_config, kv_cache_groups)
+    if any(is_kimi_gqa_draft_spec(group.kv_cache_spec) for group in kv_cache_groups):
+        return kimi_gqa_max_memory(vllm_config, kv_cache_groups)
     if tq_cache.uses_turboquant_groups(kv_cache_groups):
         return tq_cache.max_memory_usage(vllm_config, kv_cache_groups)
     if _get_glm5_next_cache_layout(kv_cache_groups) is not None:
@@ -670,6 +682,13 @@ def _get_glm5_next_kv_cache_groups(
 ) -> list[KVCacheGroupSpec]:
     if getattr(vllm_config.model_config.hf_config, "model_type", None) == "kimi_k31":
         return paired_sfa_cache_groups(vllm_config, kv_cache_spec)
+    draft = {name: spec for name, spec in kv_cache_spec.items() if is_kimi_gqa_draft_spec(spec)}
+    if draft:
+        target = {name: spec for name, spec in kv_cache_spec.items() if name not in draft}
+        if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
+            raise ValueError("Kimi GQA DSpark requires the hybrid KV cache manager")
+        groups = _orig_get_kv_cache_groups(vllm_config, target)
+        return append_kimi_gqa_draft_groups(groups, draft)
     if any(is_glm5_next_cache_spec(spec) for spec in kv_cache_spec.values()):
         return get_glm5_next_kv_cache_groups(vllm_config, kv_cache_spec)
     kimi_groups = _kimi_c8_mixed_page_groups(kv_cache_spec)
@@ -698,6 +717,10 @@ def _ascend_get_kv_cache_config_from_groups(
     if getattr(vllm_config.model_config.hf_config, "model_type", None) == "kimi_k31":
         kv_cache_config = paired_sfa_cache_config(
             vllm_config, kv_cache_groups, available_memory, num_blocks_per_group=num_blocks_per_group
+        )
+    elif any(is_kimi_gqa_draft_spec(group.kv_cache_spec) for group in kv_cache_groups):
+        kv_cache_config = kimi_gqa_cache_config(
+            vllm_config, kv_cache_groups, available_memory, _orig_get_kv_cache_config_from_groups
         )
     elif is_deepseek_v41_cache(kv_cache_groups):
         kv_cache_config = get_deepseek_v41_kv_cache_config(vllm_config, kv_cache_groups, available_memory)
