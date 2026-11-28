@@ -10,7 +10,7 @@ from vllm.model_executor.models.qwen3_dflash import (
 from vllm.triton_utils import HAS_TRITON
 
 from vllm_ascend.attention.attention_v1 import AscendKimiK31GQADraftAttentionBackend
-from vllm_ascend.core.kv_cache_interface import uses_kimi_k31_gqa_draft
+from vllm_ascend.core.kv_cache_interface import uses_kimi_gqa_draft
 from vllm_ascend.ops.rotary_embedding import AscendRotaryEmbedding
 
 _original_dflash_attention = qwen3_dflash.Attention
@@ -20,10 +20,14 @@ def _create_dflash_attention(*args, **kwargs):
     # Bind the CP1 backend at construction. The target's cache initialization
     # later asks this same backend class for the draft layer's metadata builder.
     config = get_current_vllm_config_or_none()
-    if config is not None and uses_kimi_k31_gqa_draft(config):
+    if config is not None and uses_kimi_gqa_draft(config):
         if config.parallel_config.decode_context_parallel_size == 1 and get_dcp_group().world_size > 1:
             kwargs["attn_backend"] = AscendKimiK31GQADraftAttentionBackend
-    return _original_dflash_attention(*args, **kwargs)
+    layer = _original_dflash_attention(*args, **kwargs)
+    if config is not None and uses_kimi_gqa_draft(config):
+        layer.is_kimi_gqa_draft = True
+        layer.align_kv_cache_with_mamba = False
+    return layer
 
 
 qwen3_dflash.Attention = _create_dflash_attention

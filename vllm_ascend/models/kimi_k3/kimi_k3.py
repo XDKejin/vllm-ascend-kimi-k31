@@ -92,7 +92,7 @@ from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config, is_kimi_c8_config
 from vllm_ascend.ascend_forward_context import register_kimi_moe_quant_type
 from vllm_ascend.attention.utils import mark_fused_preprocess_weights
-from vllm_ascend.core.kv_cache_interface import uses_kimi_k31_bf16_cache, uses_kimi_k31_gqa_draft
+from vllm_ascend.core.kv_cache_interface import uses_kimi_k31_bf16_cache, uses_kimi_gqa_draft
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.models.common.ops.sequence_parallel import (
     sp_all_gather,
@@ -676,7 +676,7 @@ def _needs_topk_indices_buffer(config, vllm_config) -> bool:
         return False
     if not (
         vllm_config.use_v2_model_runner
-        and uses_kimi_k31_gqa_draft(vllm_config)
+        and uses_kimi_gqa_draft(vllm_config)
         and uses_kimi_k31_bf16_cache(vllm_config)
         and vllm_config.parallel_config.pipeline_parallel_size == 1
         and vllm_config.attention_config.backend is None
@@ -702,7 +702,7 @@ class AscendKimiDSAAttention(AscendKimiMLAAttention):
         # cache layers, MLA wrapper, and sparse backend used by GLM DSA.
         rope_length = (
             kimi_k31_rope_cache_length(config, vllm_config)
-            if uses_kimi_k31_gqa_draft(vllm_config)
+            if uses_kimi_gqa_draft(vllm_config)
             else config.max_position_embeddings
         )
         DeepseekV2MLAAttention.__init__(

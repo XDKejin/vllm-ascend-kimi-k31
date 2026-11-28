@@ -37,7 +37,7 @@ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import get_eagle3_aux_lay
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.mla_v1 import AscendMLABackend, all_mla_use_flashmla
-from vllm_ascend.core.kv_cache_interface import uses_kimi_k31_gqa_draft, with_kimi_k31_gqa_draft_dcp_config
+from vllm_ascend.core.kv_cache_interface import uses_kimi_gqa_draft
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context import (
     DSparkContextChunk,
     initialize_draft_context_chunk,
@@ -75,7 +75,25 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
         self._serving_draft_batch = False
         self.attn_architecture: str | None = None
         self._draft_mla_uses_device_lengths = False
+        self._window_gqa_attn_vllm_config: VllmConfig | None = None
         self._init_dcp()
+
+    @property
+    def attn_vllm_config(self) -> VllmConfig:
+        """Use a cached local DCP=1 config for a replicated Window-GQA draft."""
+        if not uses_kimi_gqa_draft(self.vllm_config):
+            return super().attn_vllm_config
+        if getattr(self, "_window_gqa_attn_vllm_config", None) is None:
+            config = copy(self.vllm_config)
+            config.cache_config = copy(config.cache_config)
+            config.attention_config = copy(config.attention_config)
+            config.attention_config.use_non_causal = self.requires_non_causal
+            config.parallel_config = copy(config.parallel_config)
+            config.parallel_config.decode_context_parallel_size = 1
+            config.parallel_config.dcp_kv_cache_interleave_size = 1
+            config.parallel_config.cp_kv_cache_interleave_size = 1
+            self._window_gqa_attn_vllm_config = config
+        return self._window_gqa_attn_vllm_config
 
     def _init_dcp(self) -> None:
         self.use_dcp = self.attn_vllm_config.parallel_config.decode_context_parallel_size > 1
@@ -92,12 +110,8 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
             use_async_scheduling=self.vllm_config.scheduler_config.async_scheduling,
         )
 
-    @property
-    def attn_vllm_config(self) -> VllmConfig:
-        return with_kimi_k31_gqa_draft_dcp_config(super().attn_vllm_config)
-
     def _combine_aux_hidden_states(self, states: list[torch.Tensor]) -> torch.Tensor:
-        if uses_kimi_k31_gqa_draft(self.vllm_config):
+        if uses_kimi_gqa_draft(self.vllm_config):
             first = states[0]
             if first.ndim == 2 and first.numel():
                 rows, width = first.shape
@@ -265,7 +279,7 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
     ) -> None:
         draft_config = self.attn_vllm_config
         draft_block_tables = block_tables
-        uses_local_draft = block_tables.cp_size > 1 and uses_kimi_k31_gqa_draft(self.vllm_config)
+        uses_local_draft = block_tables.cp_size > 1 and uses_kimi_gqa_draft(self.vllm_config)
         if uses_local_draft:
             # Share the same block IDs and graph-stable tensors. Only the
             # token-to-slot geometry differs for this draft's own groups.

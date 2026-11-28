@@ -86,8 +86,10 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendSlidingWindowMLASpec,
     get_kv_cache_compression_ratio,
     get_storage_block_size,
+    is_kimi_gqa_draft_spec,
+    is_kimi_k31_model_config,
     supports_component_major_mla_pd,
-    uses_kimi_k31_bf16_cache,
+    uses_kimi_gqa_draft,
 )
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
@@ -385,6 +387,11 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             attention_layer_names.append(layer_name)
             continue
 
+    if uses_kimi_gqa_draft(vllm_config):
+        draft_names = [name for name, layer in attn_layers.items() if getattr(layer, "is_kimi_gqa_draft", False)]
+        kv_cache_spec = mark_kimi_gqa_draft_specs(vllm_config, kv_cache_spec, draft_names)
+        attention_layer_names = [name for name in attention_layer_names if not is_kimi_gqa_draft_spec(kv_cache_spec[name])]
+
     if mamba_specs:
         if any(isinstance(spec, AscendSFAIndexerCacheSpec) for spec in kv_cache_spec.values()):
             # K3.1 recurrent padding is settled by NPUPlatform before the
@@ -410,7 +417,7 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
         page_pool = (
             [*c8_attention_specs, *mamba_specs.values()]
             if c8_attention_specs
-            else [*kv_cache_spec.values(), *mamba_specs.values()]
+            else [spec for spec in kv_cache_spec.values() if not is_kimi_gqa_draft_spec(spec)] + list(mamba_specs.values())
         )
         common_page_size = max(spec.page_size_bytes for spec in page_pool)
         c8_page_alignments = [spec.static_fp8_kernel_block_size * spec.static_fp8_width for spec in c8_attention_specs]
@@ -431,31 +438,38 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
     return kv_cache_spec
 
 
-def mark_kimi_k31_gqa_draft_specs(
+def mark_kimi_gqa_draft_specs(
     vllm_config: VllmConfig,
     kv_cache_specs: dict[str, KVCacheSpec],
     draft_layer_names: Sequence[str],
 ) -> dict[str, KVCacheSpec]:
-    """Preserve GQA cache roles when the MRv2 worker sends specs to the engine."""
+    """Preserve GQA cache roles when the V2 worker sends specs to the engine."""
     parallel_config = vllm_config.parallel_config
     if parallel_config.prefill_context_parallel_size != 1:
-        raise ValueError("Kimi K3.1 GQA DSpark requires PCP=1.")
+        raise ValueError("Kimi GQA DSpark requires PCP=1.")
     if not draft_layer_names or set(draft_layer_names) - kv_cache_specs.keys():
-        raise ValueError("Kimi K3.1 GQA DSpark must publish a cache spec for every draft attention layer.")
+        raise ValueError("Kimi GQA DSpark must publish a cache spec for every draft attention layer.")
 
     marked = dict(kv_cache_specs)
     transfer = vllm_config.kv_transfer_config
+    is_k3 = getattr(vllm_config.model_config.hf_config, "model_type", None) in ("kimi_k3", "kimi_linear")
     pack_swa = (
-        transfer is not None and supports_component_major_mla_pd(vllm_config) and uses_kimi_k31_bf16_cache(vllm_config)
+        transfer is not None
+        and supports_component_major_mla_pd(vllm_config)
+        and (is_kimi_k31_model_config(vllm_config.model_config) or is_k3)
     )
     for name in draft_layer_names:
         spec = kv_cache_specs[name]
-        if type(spec) is FullAttentionSpec:
+        if is_kimi_gqa_draft_spec(spec):
+            continue
+        if type(spec) is FullAttentionSpec and spec.sliding_window is not None:
+            draft_spec_type = AscendGQADraftSlidingWindowSpec
+        elif type(spec) is FullAttentionSpec:
             draft_spec_type = AscendGQADraftFullAttentionSpec
         elif type(spec) is SlidingWindowSpec:
             draft_spec_type = AscendGQADraftSlidingWindowSpec
         else:
-            raise ValueError(f"Unsupported Kimi K3.1 GQA DSpark cache spec for {name}: {type(spec).__name__}.")
+            raise ValueError(f"Unsupported Kimi GQA DSpark cache spec for {name}: {type(spec).__name__}.")
         if (
             spec.dtype != torch.bfloat16
             or spec.kv_quant_mode != KVQuantMode.NONE
@@ -463,7 +477,7 @@ def mark_kimi_k31_gqa_draft_specs(
             or spec.head_size != spec.head_size_v
             or spec.tokens_per_state != 1
         ):
-            raise ValueError(f"Kimi K3.1 GQA DSpark requires unpadded BF16 K/V pages for {name}.")
+            raise ValueError(f"Kimi GQA DSpark requires unpadded BF16 K/V pages for {name}.")
         if pack_swa and draft_spec_type is AscendGQADraftSlidingWindowSpec:
             # A draft page consumes a whole ID in the much wider target/KDA
             # pool. Group several native FIA pages under one scheduler ID.
@@ -472,16 +486,27 @@ def mark_kimi_k31_gqa_draft_specs(
                 raise ValueError(f"dspark_swa_block_size must be a positive multiple of {spec.block_size}.")
             spec = replace(spec, block_size=manager_block, page_size_padded=None)
         marked[name] = draft_spec_type(
-            **{field.name: getattr(spec, field.name) for field in fields(spec) if field.init}
+            **{
+                field.name: getattr(spec, field.name)
+                for field in fields(draft_spec_type)
+                if field.init and hasattr(spec, field.name)
+            }
         )
     logger.info_once(
-        "Kimi K3.1 GQA DSpark KV cache specs (layer, type, block size, page bytes): %s",
+        "Kimi GQA DSpark KV cache specs (layer, type, block size, page bytes): %s",
         tuple(
-            (name, type(marked[name]).__name__, marked[name].block_size, marked[name].page_size_bytes)
+            (
+                name,
+                type(marked[name]).__name__,
+                marked[name].block_size,
+                marked[name].page_size_bytes,
+            )
             for name in draft_layer_names
         ),
     )
     return marked
+
+mark_kimi_k31_gqa_draft_specs = mark_kimi_gqa_draft_specs
 
 
 def _get_parallel_config_for_attn_metadata(attn_groups: list[list[AttentionGroup]]) -> ParallelConfig | None:
@@ -1296,7 +1321,9 @@ def _allocate_kv_cache(
     # also contain MLA and indexer specs, but retain independent allocations.
     # K3.1 PP ranks with only recurrent or draft layers still use paired backing.
     hf_config = getattr(getattr(vllm_config, "model_config", None), "hf_config", None)
-    is_paired_sfa = getattr(hf_config, "model_type", None) == "kimi_k31"
+    uses_kimi_shared_backing = getattr(hf_config, "model_type", None) == "kimi_k31" or any(
+        is_kimi_gqa_draft_spec(spec) for spec in layer_kv_cache_spec.values()
+    )
     layer_block_counts = {
         layer: count
         for group, count in zip(
@@ -1304,7 +1331,7 @@ def _allocate_kv_cache(
         )
         for layer in group.layer_names
     }
-    if (use_hybrid_layout or is_paired_sfa) and not is_dsv4_model and not is_glm5_next:
+    if (use_hybrid_layout or uses_kimi_shared_backing) and not is_dsv4_model and not is_glm5_next:
         hybrid_backing = _allocate_int8_cache_tensor(kv_cache_config.kv_cache_tensors[0].size, alignment, device)
 
     layerwise_reuse = get_layerwise_reuse_config(vllm_config.kv_transfer_config) is not None
