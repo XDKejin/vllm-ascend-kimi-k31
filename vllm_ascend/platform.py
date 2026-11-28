@@ -1918,16 +1918,25 @@ def _validate_draft_decode_context_parallel_config(vllm_config: VllmConfig) -> N
     else:
         draft_tensor_parallel_size = parallel_config.tensor_parallel_size
 
-    from vllm_ascend.core.kv_cache_interface import uses_kimi_k31_gqa_draft
+    from vllm_ascend.core.kv_cache_interface import uses_kimi_gqa_draft
 
-    if uses_kimi_k31_gqa_draft(vllm_config):
-        if not _validate_kimi_k31_bf16_dcp(vllm_config) or draft_tensor_parallel_size != 8:
-            raise ValueError(
-                "Kimi K3.1 GQA DSpark with target DCP requires the RunnerV2 BF16 TP8/DCP8/PCP1/PP1 path "
-                "and a TP8 draft."
-            )
-        # This draft retains its TP KV head shards across the entire token axis.
-        # Its effective DCP size is 1.
+    if uses_kimi_gqa_draft(vllm_config):
+        from vllm_ascend.core.kv_cache_interface import is_kimi_k31_model_config
+
+        if is_kimi_k31_model_config(vllm_config.model_config):
+            if not _validate_kimi_k31_bf16_dcp(vllm_config) or draft_tensor_parallel_size != 8:
+                raise ValueError(
+                    "Kimi K3.1 GQA DSpark with target DCP requires the RunnerV2 BF16 TP8/DCP8/PCP1/PP1 path "
+                    "and a TP8 draft."
+                )
+        elif (
+            parallel_config.prefill_context_parallel_size != 1
+            or parallel_config.pipeline_parallel_size != 1
+            or draft_tensor_parallel_size != parallel_config.tensor_parallel_size
+        ):
+            raise ValueError("Kimi K3 GQA DSpark with target DCP requires PCP1/PP1 and matching target/draft TP.")
+        # Keep the baseline K3.1 contract: target DCP is unchanged; the draft
+        # retains TP head shards and uses a replicated sequence (local DCP=1).
         return
 
     if pcp_size > 1:
